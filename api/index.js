@@ -1,131 +1,92 @@
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
+export const runtime = "nodejs";
 
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-  supportsResponseStreaming: true,
-  maxDuration: 25,
-};
+const TARGET = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
-/**
- * Upstream target
- */
-const TARGET = (process.env.TARGET_DOMAIN || "")
-  .trim()
-  .replace(/\/$/, "");
-
-/**
- * Basic in-memory rate limiter (per instance)
- */
+// --- Simple Rate Limit (per instance)
 const rateMap = new Map();
+const WINDOW = 60 * 1000;
+const MAX = 60;
 
-/**
- * Rate limit config
- */
-const WINDOW_MS = 60 * 1000;
-const MAX_REQ = 60;
-
-/**
- * Check rate limit
- */
 function isAllowed(ip) {
   const now = Date.now();
-  const record = rateMap.get(ip) || { count: 0, time: now };
+  const rec = rateMap.get(ip) || { count: 0, time: now };
 
-  if (now - record.time > WINDOW_MS) {
-    record.count = 0;
-    record.time = now;
+  if (now - rec.time > WINDOW) {
+    rec.count = 0;
+    rec.time = now;
   }
 
-  record.count++;
-  rateMap.set(ip, record);
+  rec.count++;
+  rateMap.set(ip, rec);
 
-  return record.count <= MAX_REQ;
+  return rec.count <= MAX;
 }
 
-/**
- * Clean headers
- */
-function buildHeaders(req) {
-  const headers = {};
+// --- Clean headers
+function cleanHeaders(headers) {
+  const result = {};
 
-  for (const k of Object.keys(req.headers)) {
-    const key = k.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    const k = key.toLowerCase();
 
     if (
-      key.startsWith("x-vercel-") ||
-      key === "host" ||
-      key === "connection" ||
-      key === "transfer-encoding"
-    ) {
-      continue;
-    }
+      k === "host" ||
+      k === "connection" ||
+      k === "content-length"
+    ) continue;
 
-    const val = req.headers[k];
-    if (!val) continue;
-
-    headers[key] = Array.isArray(val) ? val.join(",") : val;
+    if (value) result[k] = value;
   }
 
-  return headers;
+  return result;
 }
 
-/**
- * Handler
- */
 export default async function handler(req, res) {
   if (!TARGET) {
     return res.status(500).end("Server misconfigured");
   }
 
-  /**
-   * Identify client
-   */
-  const ip =
-    req.headers["x-forwarded-for"] ||
-    req.socket?.remoteAddress ||
-    "unknown";
+  // --- IP detection (safe)
+  const ip = (req.headers["x-forwarded-for"] || "")
+    .split(",")[0]
+    .trim() || req.socket?.remoteAddress || "unknown";
 
-  /**
-   * Rate limit protection
-   */
+  // --- Rate limit
   if (!isAllowed(ip)) {
     return res.status(429).end("Too Many Requests");
   }
 
+  // --- Optional API key protection (strongly recommended)
+  if (process.env.API_KEY) {
+    if (req.headers["x-api-key"] !== process.env.API_KEY) {
+      return res.status(403).end("Forbidden");
+    }
+  }
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
+  const timeout = setTimeout(() => controller.abort(), 30000);
 
   try {
     const url = TARGET + req.url;
 
-    const method = req.method || "GET";
-
-    const isBody = method !== "GET" && method !== "HEAD";
+    const isBody = !["GET", "HEAD"].includes(req.method);
 
     const upstream = await fetch(url, {
-      method,
-      headers: buildHeaders(req),
-      redirect: "manual",
+      method: req.method,
+      headers: cleanHeaders(req.headers),
+      body: isBody ? req : undefined,
       signal: controller.signal,
-      duplex: isBody ? "half" : undefined,
-      body: isBody ? Readable.toWeb(req) : undefined,
+      redirect: "manual",
     });
 
-    res.statusCode = upstream.status;
+    // --- status
+    res.status(upstream.status);
 
-    /**
-     * Forward safe headers only
-     */
+    // --- headers
     upstream.headers.forEach((value, key) => {
-      const k = key.toLowerCase();
-
       if (
-        k === "transfer-encoding" ||
-        k === "connection" ||
-        k === "content-encoding"
+        key.toLowerCase() === "transfer-encoding" ||
+        key.toLowerCase() === "connection"
       ) return;
 
       try {
@@ -133,27 +94,31 @@ export default async function handler(req, res) {
       } catch {}
     });
 
-    res.setHeader("x-proxy", "stable-node");
+    res.setHeader("x-proxy", "vercel-stable");
 
+    // --- stream response (بدون node:stream)
     if (!upstream.body) {
       return res.end();
     }
 
-    await pipeline(
-      Readable.fromWeb(upstream.body),
-      res
-    );
+    const reader = upstream.body.getReader();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+
+    res.end();
 
   } catch (err) {
-    console.error("[proxy-error]", err?.message);
+    console.error("proxy error:", err?.message);
 
     if (!res.headersSent) {
-      if (err?.name === "AbortError") {
-        res.statusCode = 504;
-        res.end("Timeout");
+      if (err.name === "AbortError") {
+        res.status(504).end("Timeout");
       } else {
-        res.statusCode = 502;
-        res.end("Bad Gateway");
+        res.status(502).end("Bad Gateway");
       }
     }
   } finally {
