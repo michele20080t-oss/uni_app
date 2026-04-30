@@ -1,0 +1,8 @@
+{
+  "name": "uni_app",
+  "version": "1.1.0",
+  "type": "module",
+  "description": "just for fun",
+  "private": true,
+  "license": "MIT"
+}
