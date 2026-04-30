@@ -1,14 +1,23 @@
 {
   "version": 2,
-  "name": "edge-content-serviceedge",
+
+  "name": "content-gateway",
+
   "functions": {
-    "api/index.js": {
-      "memory": 128,
-      "maxDuration": 60
+    "api/**/*.js": {
+      "memory": 512,
+      "maxDuration": 25
     }
   },
+
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index" }
+    {
+      "source": "/:path*",
+      "destination": "/api/index"
+    }
   ],
-  "trailingSlash": false
+
+  "trailingSlash": false,
+
+  "cleanUrls": true
 }
