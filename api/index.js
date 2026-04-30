@@ -1,293 +1,162 @@
-/**
- * ---------------------------------------------------------
- * Optimized Streaming Relay For Vercel
- * ---------------------------------------------------------
- * Features:
- * - Native streaming
- * - Low memory footprint
- * - Better upstream compatibility
- * - Stable fetch handling
- * - Safer header forwarding
- * - Timeout protection
- * - Minimal overhead
- * ---------------------------------------------------------
- */
-
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-/**
- * Vercel runtime configuration
- */
 export const config = {
   api: {
     bodyParser: false,
   },
-
   supportsResponseStreaming: true,
-
-  /**
-   * Keep execution short for stability
-   */
-  maxDuration: 30,
+  maxDuration: 25,
 };
 
 /**
- * Upstream base URL
+ * Upstream target
  */
-const UPSTREAM_BASE =
-  (process.env.TARGET_DOMAIN || "")
-    .trim()
-    .replace(/\/$/, "");
+const TARGET = (process.env.TARGET_DOMAIN || "")
+  .trim()
+  .replace(/\/$/, "");
 
 /**
- * Headers that should never be proxied
+ * Basic in-memory rate limiter (per instance)
  */
-const BLOCKED_HEADERS = new Set([
-  "host",
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-  "forwarded",
-  "x-forwarded-host",
-  "x-forwarded-proto",
-  "x-forwarded-port",
-]);
+const rateMap = new Map();
 
 /**
- * Validate target URL
+ * Rate limit config
  */
-function isValidTarget(url) {
-  try {
-    const parsed = new URL(url);
+const WINDOW_MS = 60 * 1000;
+const MAX_REQ = 60;
 
-    return (
-      parsed.protocol === "https:" ||
-      parsed.protocol === "http:"
-    );
-  } catch {
-    return false;
+/**
+ * Check rate limit
+ */
+function isAllowed(ip) {
+  const now = Date.now();
+  const record = rateMap.get(ip) || { count: 0, time: now };
+
+  if (now - record.time > WINDOW_MS) {
+    record.count = 0;
+    record.time = now;
   }
+
+  record.count++;
+  rateMap.set(ip, record);
+
+  return record.count <= MAX_REQ;
 }
 
 /**
- * Build safe outbound headers
+ * Clean headers
  */
-function buildHeaders(request) {
-  const result = {};
+function buildHeaders(req) {
+  const headers = {};
 
-  let forwardedIp = null;
+  for (const k of Object.keys(req.headers)) {
+    const key = k.toLowerCase();
 
-  for (const key of Object.keys(request.headers)) {
-    const normalizedKey = key.toLowerCase();
-
-    if (BLOCKED_HEADERS.has(normalizedKey)) {
-      continue;
-    }
-
-    if (normalizedKey.startsWith("x-vercel-")) {
-      continue;
-    }
-
-    const value = request.headers[key];
-
-    if (!value) {
-      continue;
-    }
-
-    /**
-     * Preserve real client IP
-     */
     if (
-      normalizedKey === "x-real-ip" ||
-      normalizedKey === "x-forwarded-for"
-    ) {
-      if (!forwardedIp) {
-        forwardedIp = Array.isArray(value)
-          ? value[0]
-          : value;
-      }
-
-      continue;
-    }
-
-    result[normalizedKey] = Array.isArray(value)
-      ? value.join(", ")
-      : value;
-  }
-
-  /**
-   * Restore forwarded IP
-   */
-  if (forwardedIp) {
-    result["x-forwarded-for"] = forwardedIp;
-  }
-
-  return result;
-}
-
-/**
- * Copy upstream response headers safely
- */
-function applyHeaders(response, upstreamHeaders) {
-  for (const [key, value] of upstreamHeaders.entries()) {
-    const normalizedKey = key.toLowerCase();
-
-    /**
-     * Prevent Node stream conflicts
-     */
-    if (
-      normalizedKey === "transfer-encoding" ||
-      normalizedKey === "connection"
+      key.startsWith("x-vercel-") ||
+      key === "host" ||
+      key === "connection" ||
+      key === "transfer-encoding"
     ) {
       continue;
     }
 
-    try {
-      response.setHeader(key, value);
-    } catch {
-      // Ignore invalid header errors
-    }
+    const val = req.headers[k];
+    if (!val) continue;
+
+    headers[key] = Array.isArray(val) ? val.join(",") : val;
   }
+
+  return headers;
 }
 
 /**
- * Main relay handler
+ * Handler
  */
 export default async function handler(req, res) {
-  /**
-   * Validate configuration
-   */
-  if (!UPSTREAM_BASE || !isValidTarget(UPSTREAM_BASE)) {
-    res.statusCode = 500;
-
-    return res.end(
-      "Invalid TARGET_DOMAIN"
-    );
+  if (!TARGET) {
+    return res.status(500).end("Server misconfigured");
   }
 
   /**
-   * Build target URL
+   * Identify client
    */
-  const upstreamUrl =
-    UPSTREAM_BASE + req.url;
+  const ip =
+    req.headers["x-forwarded-for"] ||
+    req.socket?.remoteAddress ||
+    "unknown";
 
   /**
-   * Timeout controller
+   * Rate limit protection
    */
+  if (!isAllowed(ip)) {
+    return res.status(429).end("Too Many Requests");
+  }
+
   const controller = new AbortController();
-
-  /**
-   * Prevent long-running executions
-   */
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, 25000);
+  const timeout = setTimeout(() => controller.abort(), 20000);
 
   try {
-    const method =
-      req.method || "GET";
+    const url = TARGET + req.url;
 
-    const hasBody =
-      method !== "GET" &&
-      method !== "HEAD";
+    const method = req.method || "GET";
 
-    /**
-     * Fetch options
-     */
-    const requestOptions = {
+    const isBody = method !== "GET" && method !== "HEAD";
+
+    const upstream = await fetch(url, {
       method,
       headers: buildHeaders(req),
       redirect: "manual",
       signal: controller.signal,
-    };
+      duplex: isBody ? "half" : undefined,
+      body: isBody ? Readable.toWeb(req) : undefined,
+    });
+
+    res.statusCode = upstream.status;
 
     /**
-     * Stream request body if needed
+     * Forward safe headers only
      */
-    if (hasBody) {
-      requestOptions.body =
-        Readable.toWeb(req);
+    upstream.headers.forEach((value, key) => {
+      const k = key.toLowerCase();
 
-      requestOptions.duplex = "half";
+      if (
+        k === "transfer-encoding" ||
+        k === "connection" ||
+        k === "content-encoding"
+      ) return;
+
+      try {
+        res.setHeader(key, value);
+      } catch {}
+    });
+
+    res.setHeader("x-proxy", "stable-node");
+
+    if (!upstream.body) {
+      return res.end();
     }
 
-    /**
-     * Forward request upstream
-     */
-    const upstreamResponse =
-      await fetch(
-        upstreamUrl,
-        requestOptions
-      );
-
-    /**
-     * Forward status code
-     */
-    res.statusCode =
-      upstreamResponse.status;
-
-    /**
-     * Apply upstream headers
-     */
-    applyHeaders(
-      res,
-      upstreamResponse.headers
+    await pipeline(
+      Readable.fromWeb(upstream.body),
+      res
     );
 
-    /**
-     * Optional runtime marker
-     */
-    res.setHeader(
-      "x-runtime",
-      "vercel-node"
-    );
+  } catch (err) {
+    console.error("[proxy-error]", err?.message);
 
-    /**
-     * Stream upstream response
-     */
-    if (upstreamResponse.body) {
-      await pipeline(
-        Readable.fromWeb(
-          upstreamResponse.body
-        ),
-        res
-      );
-    } else {
-      res.end();
-    }
-  } catch (error) {
-    /**
-     * Minimal logging
-     */
-    console.error(
-      "[relay-error]",
-      error?.message || "unknown"
-    );
-
-    /**
-     * Prevent double response
-     */
     if (!res.headersSent) {
-      if (error?.name === "AbortError") {
+      if (err?.name === "AbortError") {
         res.statusCode = 504;
-
-        res.end("Gateway Timeout");
+        res.end("Timeout");
       } else {
         res.statusCode = 502;
-
         res.end("Bad Gateway");
       }
     }
   } finally {
-    /**
-     * Cleanup timeout
-     */
     clearTimeout(timeout);
   }
 }
