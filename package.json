@@ -1,8 +1,9 @@
 {
-  "name": "edge-content-service",
-  "version": "1.1.0",
-  "type": "module",
-  "description": "just for fun",
+  "name": "content-gateway",
+  "version": "1.0.0",
   "private": true,
-  "license": "MIT"
+  "type": "module",
+  "engines": {
+    "node": "18.x"
+  }
 }
