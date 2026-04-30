@@ -1,27 +1,49 @@
-// Import Node.js stream utilities for handling streaming data
+/**
+ * ---------------------------------------------------------
+ * Optimized Streaming Relay For Vercel
+ * ---------------------------------------------------------
+ * Features:
+ * - Native streaming
+ * - Low memory footprint
+ * - Better upstream compatibility
+ * - Stable fetch handling
+ * - Safer header forwarding
+ * - Timeout protection
+ * - Minimal overhead
+ * ---------------------------------------------------------
+ */
+
 import { Readable } from "node:stream";
-// Pipeline utility for safely piping streams with proper error handling
 import { pipeline } from "node:stream/promises";
 
-// API configuration (used in frameworks like Next.js / Vercel)
+/**
+ * Vercel runtime configuration
+ */
 export const config = {
-  // Disable built-in body parser to allow raw stream handling
-  api: { bodyParser: false },
+  api: {
+    bodyParser: false,
+  },
 
-  // Enable streaming responses to client
   supportsResponseStreaming: true,
 
-  // Maximum execution time for this API route (in seconds)
-  maxDuration: 60,
+  /**
+   * Keep execution short for stability
+   */
+  maxDuration: 30,
 };
 
-// Base URL of the upstream server (proxy target)
-// Trailing slash is removed to avoid malformed URLs
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+/**
+ * Upstream base URL
+ */
+const UPSTREAM_BASE =
+  (process.env.TARGET_DOMAIN || "")
+    .trim()
+    .replace(/\/$/, "");
 
-// List of HTTP headers that should NOT be forwarded to upstream server
-// These are removed to prevent proxy loops and protocol conflicts
-const STRIP_HEADERS = new Set([
+/**
+ * Headers that should never be proxied
+ */
+const BLOCKED_HEADERS = new Set([
   "host",
   "connection",
   "keep-alive",
@@ -37,112 +59,235 @@ const STRIP_HEADERS = new Set([
   "x-forwarded-port",
 ]);
 
-// Main API handler function (acts as a reverse proxy)
-export default async function handler(req, res) {
-  // Ensure target server is configured
-  if (!TARGET_BASE) {
-    res.statusCode = 500;
-    return res.end("Misconfigured: TARGET_DOMAIN is not set");
+/**
+ * Validate target URL
+ */
+function isValidTarget(url) {
+  try {
+    const parsed = new URL(url);
+
+    return (
+      parsed.protocol === "https:" ||
+      parsed.protocol === "http:"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build safe outbound headers
+ */
+function buildHeaders(request) {
+  const result = {};
+
+  let forwardedIp = null;
+
+  for (const key of Object.keys(request.headers)) {
+    const normalizedKey = key.toLowerCase();
+
+    if (BLOCKED_HEADERS.has(normalizedKey)) {
+      continue;
+    }
+
+    if (normalizedKey.startsWith("x-vercel-")) {
+      continue;
+    }
+
+    const value = request.headers[key];
+
+    if (!value) {
+      continue;
+    }
+
+    /**
+     * Preserve real client IP
+     */
+    if (
+      normalizedKey === "x-real-ip" ||
+      normalizedKey === "x-forwarded-for"
+    ) {
+      if (!forwardedIp) {
+        forwardedIp = Array.isArray(value)
+          ? value[0]
+          : value;
+      }
+
+      continue;
+    }
+
+    result[normalizedKey] = Array.isArray(value)
+      ? value.join(", ")
+      : value;
   }
 
-  try {
-    // Construct full upstream URL using incoming request path
-    const targetUrl = TARGET_BASE + req.url;
+  /**
+   * Restore forwarded IP
+   */
+  if (forwardedIp) {
+    result["x-forwarded-for"] = forwardedIp;
+  }
 
-    // Object that will contain sanitized headers for upstream request
-    const headers = {};
+  return result;
+}
 
-    // Variable to store client IP address if available
-    let clientIp = null;
+/**
+ * Copy upstream response headers safely
+ */
+function applyHeaders(response, upstreamHeaders) {
+  for (const [key, value] of upstreamHeaders.entries()) {
+    const normalizedKey = key.toLowerCase();
 
-    // Iterate over all incoming request headers
-    for (const key of Object.keys(req.headers)) {
-      const k = key.toLowerCase();
-      const v = req.headers[key];
-
-      // Skip headers that should not be forwarded
-      if (STRIP_HEADERS.has(k)) continue;
-
-      // Remove Vercel-specific headers
-      if (k.startsWith("x-vercel-")) continue;
-
-      // Capture real client IP if provided
-      if (k === "x-real-ip") {
-        clientIp = v;
-        continue;
-      }
-
-      // Prefer first valid forwarded IP if x-forwarded-for exists
-      if (k === "x-forwarded-for") {
-        if (!clientIp) clientIp = v;
-        continue;
-      }
-
-      // Normalize header value (handle arrays)
-      headers[k] = Array.isArray(v) ? v.join(", ") : v;
+    /**
+     * Prevent Node stream conflicts
+     */
+    if (
+      normalizedKey === "transfer-encoding" ||
+      normalizedKey === "connection"
+    ) {
+      continue;
     }
 
-    // Inject client IP into forwarded headers if available
-    if (clientIp) headers["x-forwarded-for"] = clientIp;
+    try {
+      response.setHeader(key, value);
+    } catch {
+      // Ignore invalid header errors
+    }
+  }
+}
 
-    // HTTP method of incoming request
-    const method = req.method;
+/**
+ * Main relay handler
+ */
+export default async function handler(req, res) {
+  /**
+   * Validate configuration
+   */
+  if (!UPSTREAM_BASE || !isValidTarget(UPSTREAM_BASE)) {
+    res.statusCode = 500;
 
-    // Determine whether request contains a body (POST/PUT/PATCH/etc.)
-    const hasBody = method !== "GET" && method !== "HEAD";
+    return res.end(
+      "Invalid TARGET_DOMAIN"
+    );
+  }
 
-    // Options object for fetch request to upstream server
-    const fetchOpts = {
+  /**
+   * Build target URL
+   */
+  const upstreamUrl =
+    UPSTREAM_BASE + req.url;
+
+  /**
+   * Timeout controller
+   */
+  const controller = new AbortController();
+
+  /**
+   * Prevent long-running executions
+   */
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 25000);
+
+  try {
+    const method =
+      req.method || "GET";
+
+    const hasBody =
+      method !== "GET" &&
+      method !== "HEAD";
+
+    /**
+     * Fetch options
+     */
+    const requestOptions = {
       method,
-      headers,
-      redirect: "manual", // Prevent automatic redirect following
+      headers: buildHeaders(req),
+      redirect: "manual",
+      signal: controller.signal,
     };
 
-    // If request has body, stream it directly to upstream
+    /**
+     * Stream request body if needed
+     */
     if (hasBody) {
-      // Convert Node.js stream into Web stream for fetch compatibility
-      fetchOpts.body = Readable.toWeb(req);
+      requestOptions.body =
+        Readable.toWeb(req);
 
-      // Required when using streaming request bodies in Node fetch
-      fetchOpts.duplex = "half";
+      requestOptions.duplex = "half";
     }
 
-    // Send request to upstream server
-    const upstream = await fetch(targetUrl, fetchOpts);
+    /**
+     * Forward request upstream
+     */
+    const upstreamResponse =
+      await fetch(
+        upstreamUrl,
+        requestOptions
+      );
 
-    // Set response status code to match upstream response
-    res.statusCode = upstream.status;
+    /**
+     * Forward status code
+     */
+    res.statusCode =
+      upstreamResponse.status;
 
-    // Forward all upstream response headers to client
-    for (const [k, v] of upstream.headers) {
-      // Skip transfer-encoding to avoid stream corruption issues
-      if (k.toLowerCase() === "transfer-encoding") continue;
+    /**
+     * Apply upstream headers
+     */
+    applyHeaders(
+      res,
+      upstreamResponse.headers
+    );
 
-      try {
-        res.setHeader(k, v);
-      } catch {
-        // Ignore header setting errors (some headers are restricted)
-      }
-    }
+    /**
+     * Optional runtime marker
+     */
+    res.setHeader(
+      "x-runtime",
+      "vercel-node"
+    );
 
-    // If upstream response has a body, stream it directly to client
-    if (upstream.body) {
+    /**
+     * Stream upstream response
+     */
+    if (upstreamResponse.body) {
       await pipeline(
-        Readable.fromWeb(upstream.body),
+        Readable.fromWeb(
+          upstreamResponse.body
+        ),
         res
       );
     } else {
-      // If no body exists, end response immediately
       res.end();
     }
-  } catch (err) {
-    // Log any proxy or network error
-    console.error("relay error:", err);
+  } catch (error) {
+    /**
+     * Minimal logging
+     */
+    console.error(
+      "[relay-error]",
+      error?.message || "unknown"
+    );
 
-    // Send fallback error response if headers are not already sent
+    /**
+     * Prevent double response
+     */
     if (!res.headersSent) {
-      res.statusCode = 502;
-      res.end("Bad Gateway: Tunnel Failed");
+      if (error?.name === "AbortError") {
+        res.statusCode = 504;
+
+        res.end("Gateway Timeout");
+      } else {
+        res.statusCode = 502;
+
+        res.end("Bad Gateway");
+      }
     }
+  } finally {
+    /**
+     * Cleanup timeout
+     */
+    clearTimeout(timeout);
   }
 }
