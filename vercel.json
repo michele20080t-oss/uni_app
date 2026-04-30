@@ -1,23 +1,18 @@
 {
   "version": 2,
-
-  "name": "content-gateway",
-
   "functions": {
     "api/**/*.js": {
+      "runtime": "nodejs18.x",
       "memory": 512,
-      "maxDuration": 25
+      "maxDuration": 60
     }
   },
-
   "rewrites": [
     {
       "source": "/:path*",
-      "destination": "/api/index"
+      "destination": "/api/index.js"
     }
   ],
-
   "trailingSlash": false,
-
   "cleanUrls": true
 }
