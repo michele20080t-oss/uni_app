@@ -1,20 +1,14 @@
 {
   "version": 2,
-
+  "name": "edge-content-serviceedge",
   "functions": {
-    "api/**/*.js": {
-      "memory": 512,
-      "maxDuration": 30
+    "api/index.js": {
+      "memory": 128,
+      "maxDuration": 60
     }
   },
-
   "rewrites": [
-    {
-      "source": "/:path*",
-      "destination": "/api/index"
-    }
+    { "source": "/(.*)", "destination": "/api/index" }
   ],
-
-  "trailingSlash": false,
-  "cleanUrls": true
+  "trailingSlash": false
 }
